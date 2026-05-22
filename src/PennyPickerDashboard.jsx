@@ -1,600 +1,531 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 
-// ─── Alpha Vantage Config ─────────────────────────────────────────────────────
-// Drop your free key from https://www.alphavantage.co/support/#api-key
+// ─── Alpha Vantage ────────────────────────────────────────────────────────────
 const AV_BASE = "https://www.alphavantage.co/query";
 
-// ─── Curated penny stock universe (Alpha Vantage free tier has no screener endpoint)
-// Users can edit this list or extend it
-const PENNY_UNIVERSE = [
+// ─── Wider universe to scan — top 5 survivors get returned ───────────────────
+const UNIVERSE = [
   "SNDL","CLOV","ATER","BBIG","AABB","GFAI","MULN","FFIE","HCDI","ILUS",
   "MINE","AQMS","ABOS","BFRI","CLSK","CRIS","DPRO","EDSA","ENOB","EOSE",
-  "EVGO","FANH","GFAI","GOVX","HPNN","IDEX","IMPP","JBDI","KPLT","LIQT",
-  "MARA","MEGL","MNMD","NKLA","OTRK","PHIO","PRVB","RAIL","RCAT","SHIP",
+  "IDEX","IMPP","KPLT","LIQT","MEGL","MNMD","NKLA","PHIO","PRVB","RAIL",
 ];
 
-// ─── Signal logic ─────────────────────────────────────────────────────────────
-function computeSignals(quote) {
+// ─── Signal + conviction engine ───────────────────────────────────────────────
+function analyze(sym, quote) {
   const price  = parseFloat(quote["05. price"]) || 0;
   const open   = parseFloat(quote["02. open"]) || price;
   const high   = parseFloat(quote["03. high"]) || price;
   const low    = parseFloat(quote["04. low"]) || price;
+  const prev   = parseFloat(quote["08. previous close"]) || price;
   const vol    = parseInt(quote["06. volume"]) || 0;
-  const pctRaw = parseFloat(quote["10. change percent"]?.replace("%","")) || 0;
+  const pct    = parseFloat(quote["10. change percent"]?.replace("%","")) || 0;
 
-  const range   = high - low || 1;
-  const body    = Math.abs(price - open);
-  const breakout = price >= high * 0.98;
-  const momentum = pctRaw > 5;
-  const squeeze  = (body / range) < 0.3;
-  const doji     = body / range < 0.1;
-  const volSpike = vol > 1_000_000;
+  const range  = high - low || 0.0001;
+  const body   = price - open;
 
+  // ── DISQUALIFY: party already over ───────────────────────────────────────
+  // 1. Already ran hard and now retreating from high
+  const fromHigh = (high - price) / range;
+  if (fromHigh > 0.35) return null; // rolled over >35% from high — skip
+
+  // 2. Massive gap already happened — you're too late
+  if (pct > 20) return null; // already up >20% — tail risk
+
+  // 3. Price below open — trending wrong direction
+  if (price < open) return null;
+
+  // 4. Tiny volume — nobody's at the party
+  if (vol < 400000) return null;
+
+  // 5. Price must be under $5
+  if (price > 5) return null;
+  if (price <= 0) return null;
+
+  // ── SIGNALS ───────────────────────────────────────────────────────────────
   const signals = [];
-  if (breakout)  signals.push({ label: "BREAKOUT",  color: "#00ff88" });
-  if (momentum)  signals.push({ label: "MOMENTUM",  color: "#ffd700" });
-  if (volSpike)  signals.push({ label: "VOL SPIKE", color: "#ff6b35" });
-  if (squeeze)   signals.push({ label: "SQUEEZE",   color: "#a78bfa" });
-  if (doji)      signals.push({ label: "DOJI",      color: "#60a5fa" });
 
-  const score = (breakout?3:0) + (momentum?2:0) + (volSpike?2:0) + (squeeze?1:0);
+  // Breakout: near high but NOT already peaked
+  const nearHigh = (price / high) >= 0.95;
+  if (nearHigh) signals.push({ label: "BREAKOUT", color: "#00ff88", weight: 3 });
 
-  return { signals, score, price, open, high, low, vol, pct: pctRaw };
+  // Momentum: moving but not exhausted
+  const momentum = pct >= 3 && pct <= 20;
+  if (momentum) signals.push({ label: "MOMENTUM", color: "#ffd700", weight: 2 });
+
+  // Volume spike: crowd is entering
+  const volSpike = vol > 700000;
+  if (volSpike) signals.push({ label: "VOL SPIKE", color: "#ff6b35", weight: 2 });
+
+  // Still climbing: price above open and above midpoint of range
+  const midRange = low + range * 0.5;
+  const climbing = price > open && price > midRange;
+  if (climbing) signals.push({ label: "CLIMBING", color: "#a78bfa", weight: 2 });
+
+  // Fresh start: didn't gap up massively from yesterday (room left)
+  const gapFromPrev = ((open - prev) / prev) * 100;
+  const freshStart = gapFromPrev < 8;
+  if (freshStart) signals.push({ label: "FRESH", color: "#60a5fa", weight: 1 });
+
+  // ── SCORE ─────────────────────────────────────────────────────────────────
+  const score = signals.reduce((a, s) => a + s.weight, 0);
+
+  // Must have at least 3 signals and score 6+ to qualify
+  if (signals.length < 3) return null;
+  if (score < 6) return null;
+
+  // ── Position in range (0=at low, 1=at high) ───────────────────────────────
+  const rangePos = (price - low) / range;
+
+  return { sym, price, open, high, low, vol, pct, prev, signals, score, rangePos, fromHigh };
 }
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
 const css = `
-  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Barlow+Condensed:wght@300;400;600;700;800&display=swap');
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg:       #060a0f;
-    --panel:    #0b1219;
-    --border:   #1a2d3d;
-    --green:    #00ff88;
-    --red:      #ff4466;
-    --gold:     #ffd700;
-    --dim:      #3a5a72;
-    --text:     #c8dde8;
-    --mono:     'Share Tech Mono', monospace;
-    --head:     'Bebas Neue', sans-serif;
-    --body:     'DM Sans', sans-serif;
+    --bg:     #05080b;
+    --panel:  #0a0f15;
+    --border: #151f2a;
+    --green:  #00ff88;
+    --red:    #ff3355;
+    --gold:   #ffcc00;
+    --purple: #a78bfa;
+    --blue:   #38bdf8;
+    --dim:    #2a4055;
+    --muted:  #4a6880;
+    --text:   #b8ccd8;
+    --mono:   'Space Mono', monospace;
+    --display:'Barlow Condensed', sans-serif;
   }
 
-  body { background: var(--bg); color: var(--text); font-family: var(--body); }
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--mono); }
 
   .app {
     min-height: 100vh;
     background:
-      radial-gradient(ellipse 80% 40% at 50% 0%, rgba(0,255,136,0.04) 0%, transparent 70%),
-      linear-gradient(180deg, #060a0f 0%, #040810 100%);
+      radial-gradient(ellipse 60% 30% at 50% 0%, rgba(0,255,136,0.06) 0%, transparent 60%),
+      var(--bg);
   }
 
   /* ── Header ── */
-  .header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 20px 32px;
+  .hdr {
+    padding: 18px 28px;
     border-bottom: 1px solid var(--border);
-    background: rgba(11,18,25,0.9);
-    backdrop-filter: blur(12px);
+    display: flex; align-items: center; justify-content: space-between;
+    background: rgba(10,15,21,0.95);
+    backdrop-filter: blur(16px);
     position: sticky; top: 0; z-index: 100;
   }
-  .logo { font-family: var(--head); font-size: 2rem; letter-spacing: 4px; color: var(--green); }
-  .logo span { color: var(--dim); }
-  .tagline { font-family: var(--mono); font-size: 0.65rem; color: var(--dim); letter-spacing: 2px; margin-top: 2px; }
+  .logo {
+    font-family: var(--display); font-size: 2.4rem; font-weight: 800;
+    letter-spacing: 6px; color: var(--green);
+    text-shadow: 0 0 30px rgba(0,255,136,0.4);
+  }
+  .logo em { color: var(--dim); font-style: normal; }
+  .sub {
+    font-size: 0.55rem; letter-spacing: 3px; color: var(--muted);
+    margin-top: 1px; font-family: var(--mono);
+  }
 
-  /* ── API Key input ── */
-  .api-bar {
-    display: flex; gap: 8px; align-items: center;
+  /* ── API bar ── */
+  .api-row { display: flex; gap: 8px; align-items: center; }
+  .api-in {
+    background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+    color: var(--text); font-family: var(--mono); font-size: 0.7rem;
+    padding: 9px 12px; border-radius: 3px; width: 200px; outline: none;
+    transition: border .2s;
   }
-  .api-input {
-    background: rgba(0,255,136,0.05); border: 1px solid var(--border);
-    color: var(--text); font-family: var(--mono); font-size: 0.75rem;
-    padding: 8px 12px; border-radius: 4px; width: 220px;
-    outline: none; transition: border .2s;
-  }
-  .api-input:focus { border-color: var(--green); }
-  .api-input::placeholder { color: var(--dim); }
+  .api-in::placeholder { color: var(--dim); }
+  .api-in:focus { border-color: rgba(0,255,136,0.4); }
+
   .btn {
-    font-family: var(--mono); font-size: 0.7rem; letter-spacing: 1px;
-    padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer;
-    transition: all .2s; white-space: nowrap;
+    font-family: var(--display); font-weight: 700; letter-spacing: 2px;
+    font-size: 0.85rem; padding: 9px 20px; border: none; border-radius: 3px;
+    cursor: pointer; transition: all .2s; white-space: nowrap;
   }
-  .btn-green { background: var(--green); color: #000; font-weight: 700; }
-  .btn-green:hover { background: #00cc6a; box-shadow: 0 0 20px rgba(0,255,136,0.3); }
-  .btn-green:disabled { background: var(--dim); color: #0b1219; cursor: not-allowed; }
-  .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--dim); }
-  .btn-ghost:hover { border-color: var(--green); color: var(--green); }
+  .btn-save { background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 0.7rem; font-family: var(--mono); }
+  .btn-save:hover { border-color: var(--muted); color: var(--text); }
+  .btn-scan {
+    background: var(--green); color: #000;
+    box-shadow: 0 0 20px rgba(0,255,136,0.25);
+  }
+  .btn-scan:hover { background: #00e87a; box-shadow: 0 0 30px rgba(0,255,136,0.5); transform: translateY(-1px); }
+  .btn-scan:disabled { background: var(--dim); color: #0a0f15; cursor: not-allowed; box-shadow: none; transform: none; }
 
-  /* ── Status bar ── */
-  .status-bar {
-    display: flex; gap: 24px; align-items: center;
-    padding: 8px 32px;
-    background: rgba(0,0,0,0.4);
+  /* ── Status ── */
+  .status {
+    padding: 7px 28px; background: rgba(0,0,0,0.5);
     border-bottom: 1px solid var(--border);
-    font-family: var(--mono); font-size: 0.65rem; color: var(--dim);
+    display: flex; gap: 20px; align-items: center;
+    font-size: 0.6rem; letter-spacing: 1.5px; color: var(--muted);
   }
-  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); display: inline-block; margin-right: 6px; }
-  .status-dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--dim); display: inline-block; margin-right: 5px; }
+  .dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); animation: blink 1.5s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .err { color: var(--red); margin-left: auto; }
 
-  /* ── Main layout ── */
-  .main { padding: 24px 32px; }
+  /* ── Main ── */
+  .main { padding: 24px 28px; max-width: 900px; margin: 0 auto; }
 
-  /* ── Filters ── */
-  .filters {
-    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  /* ── Progress ── */
+  .prog-wrap { margin-bottom: 20px; }
+  .prog-bar { height: 1px; background: var(--border); }
+  .prog-fill { height: 100%; background: var(--green); transition: width .4s ease; box-shadow: 0 0 8px var(--green); }
+  .prog-label { font-size: 0.58rem; color: var(--muted); margin-top: 6px; letter-spacing: 1px; }
+
+  /* ── Empty state ── */
+  .empty {
+    text-align: center; padding: 100px 20px;
+  }
+  .empty-title {
+    font-family: var(--display); font-size: 5rem; font-weight: 800;
+    color: var(--border); letter-spacing: 8px; line-height: 1;
     margin-bottom: 20px;
   }
-  .filter-label { font-family: var(--mono); font-size: 0.65rem; color: var(--dim); letter-spacing: 1px; }
-  .filter-select {
-    background: var(--panel); border: 1px solid var(--border); color: var(--text);
-    font-family: var(--mono); font-size: 0.72rem; padding: 6px 10px; border-radius: 4px;
-    outline: none; cursor: pointer;
+  .empty-sub { font-size: 0.65rem; color: var(--muted); letter-spacing: 2px; line-height: 2; }
+  .empty-rules {
+    margin: 24px auto; max-width: 340px; text-align: left;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 4px; padding: 16px 20px;
   }
-  .filter-select:focus { border-color: var(--green); }
-  .search-input {
-    background: var(--panel); border: 1px solid var(--border); color: var(--text);
-    font-family: var(--mono); font-size: 0.72rem; padding: 6px 10px; border-radius: 4px;
-    outline: none; width: 140px;
-  }
-  .search-input:focus { border-color: var(--green); }
-  .search-input::placeholder { color: var(--dim); }
-
-  /* ── Stat cards ── */
-  .stat-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 20px; }
-  .stat-card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: 16px 20px; position: relative; overflow: hidden;
-  }
-  .stat-card::before {
-    content: ''; position: absolute; inset: 0;
-    background: linear-gradient(135deg, rgba(0,255,136,0.03) 0%, transparent 60%);
-  }
-  .stat-num { font-family: var(--head); font-size: 2rem; letter-spacing: 2px; }
-  .stat-num.green { color: var(--green); }
-  .stat-num.gold  { color: var(--gold); }
-  .stat-num.red   { color: var(--red); }
-  .stat-label { font-family: var(--mono); font-size: 0.6rem; color: var(--dim); letter-spacing: 2px; margin-top: 4px; }
-
-  /* ── Table ── */
-  .table-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 0.75rem; }
-  thead th {
-    text-align: left; padding: 10px 12px;
+  .empty-rules li {
+    font-size: 0.62rem; color: var(--muted); letter-spacing: 1px;
+    line-height: 2.2; list-style: none; padding-left: 0;
     border-bottom: 1px solid var(--border);
-    color: var(--dim); letter-spacing: 1px; font-size: 0.62rem;
-    cursor: pointer; user-select: none; white-space: nowrap;
-    font-family: var(--mono);
   }
-  thead th:hover { color: var(--green); }
-  thead th .sort-icon { margin-left: 4px; opacity: 0.5; }
-  thead th.active { color: var(--green); }
-  thead th.active .sort-icon { opacity: 1; }
+  .empty-rules li:last-child { border-bottom: none; }
+  .empty-rules li span { color: var(--green); margin-right: 8px; }
 
-  tbody tr {
-    border-bottom: 1px solid rgba(26,45,61,0.5);
-    transition: background .15s;
+  /* ── Cards ── */
+  .cards { display: flex; flex-direction: column; gap: 12px; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px 24px;
+    position: relative;
+    overflow: hidden;
     cursor: pointer;
+    transition: border-color .2s, transform .15s;
+    animation: fadeUp .3s ease both;
   }
-  tbody tr:hover { background: rgba(0,255,136,0.03); }
-  tbody tr.watching { background: rgba(255,215,0,0.04); }
-  tbody td { padding: 11px 12px; vertical-align: middle; }
-
-  .ticker-cell { color: #fff; font-weight: 700; letter-spacing: 1px; }
-  .price-cell { color: #fff; }
-  .pct-pos { color: var(--green); }
-  .pct-neg { color: var(--red); }
-  .vol-cell { color: var(--dim); }
-  .score-cell { text-align: center; }
-
-  .score-badge {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 28px; height: 28px; border-radius: 4px; font-weight: 700; font-size: 0.8rem;
-  }
-  .score-0 { background: rgba(58,90,114,0.3); color: var(--dim); }
-  .score-1, .score-2 { background: rgba(255,215,0,0.15); color: var(--gold); }
-  .score-3, .score-4 { background: rgba(255,107,53,0.2); color: #ff6b35; }
-  .score-5, .score-6, .score-7, .score-8 { background: rgba(0,255,136,0.15); color: var(--green); }
-
-  /* ── Signal pills ── */
-  .signals { display: flex; gap: 4px; flex-wrap: wrap; }
-  .signal-pill {
-    font-size: 0.55rem; letter-spacing: 1px; padding: 2px 6px; border-radius: 2px;
-    font-family: var(--mono); font-weight: 700; border: 1px solid;
+  .card:hover { border-color: rgba(0,255,136,0.2); transform: translateY(-1px); }
+  .card.rank-1 { border-color: rgba(0,255,136,0.35); }
+  .card.rank-1::before {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(0,255,136,0.05) 0%, transparent 50%);
   }
 
-  /* ── Star / watchlist ── */
-  .star { background: none; border: none; cursor: pointer; font-size: 1rem; line-height: 1; padding: 0; }
-  .star.on  { color: var(--gold); filter: drop-shadow(0 0 4px var(--gold)); }
-  .star.off { color: var(--border); }
-  .star:hover { color: var(--gold); }
-
-  /* ── Sparkbar (mini range viz) ── */
-  .sparkbar-wrap { display: flex; align-items: center; gap: 6px; }
-  .sparkbar { height: 4px; background: var(--border); border-radius: 2px; width: 60px; position: relative; }
-  .sparkbar-fill { height: 100%; border-radius: 2px; position: absolute; top: 0; }
-
-  /* ── Empty / loading states ── */
-  .state-box {
-    text-align: center; padding: 80px 20px;
-    font-family: var(--mono); color: var(--dim);
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
   }
-  .state-box .big { font-family: var(--head); font-size: 3rem; color: var(--border); margin-bottom: 12px; }
-  .state-box p { font-size: 0.75rem; line-height: 1.8; }
+  .card:nth-child(1) { animation-delay: 0s; }
+  .card:nth-child(2) { animation-delay: .07s; }
+  .card:nth-child(3) { animation-delay: .14s; }
+  .card:nth-child(4) { animation-delay: .21s; }
+  .card:nth-child(5) { animation-delay: .28s; }
 
-  /* ── Progress / loading bar ── */
-  .loading-bar-wrap { margin-bottom: 16px; }
-  .loading-bar {
-    height: 2px; background: var(--border); border-radius: 1px; overflow: hidden;
+  /* ── Card header ── */
+  .card-hdr { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
+  .card-left { display: flex; align-items: center; gap: 14px; }
+  .rank-num {
+    font-family: var(--display); font-size: 3rem; font-weight: 800;
+    color: var(--border); line-height: 1; min-width: 36px;
   }
-  .loading-bar-fill {
-    height: 100%; background: var(--green);
-    transition: width .3s ease;
-    box-shadow: 0 0 8px var(--green);
+  .rank-1 .rank-num { color: var(--green); }
+  .rank-2 .rank-num { color: rgba(0,255,136,0.5); }
+  .ticker {
+    font-family: var(--display); font-size: 2.2rem; font-weight: 800;
+    letter-spacing: 3px; color: #fff; line-height: 1;
   }
-  .loading-label {
-    font-family: var(--mono); font-size: 0.62rem; color: var(--dim);
-    margin-top: 6px; letter-spacing: 1px;
+  .signals { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 5px; }
+  .sig {
+    font-size: 0.52rem; letter-spacing: 1.5px; padding: 2px 7px;
+    border-radius: 2px; border: 1px solid; font-family: var(--mono); font-weight: 700;
   }
 
-  /* ── Tabs ── */
-  .tabs { display: flex; gap: 4px; margin-bottom: 20px; }
-  .tab {
-    font-family: var(--mono); font-size: 0.68rem; letter-spacing: 1px;
-    padding: 8px 18px; border-radius: 4px; cursor: pointer; border: 1px solid transparent;
-    transition: all .2s;
+  /* ── Card metrics ── */
+  .card-metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+  .metric {}
+  .metric-val {
+    font-family: var(--display); font-size: 1.5rem; font-weight: 700;
+    letter-spacing: 1px; line-height: 1;
   }
-  .tab.active { background: rgba(0,255,136,0.1); border-color: var(--green); color: var(--green); }
-  .tab.inactive { background: transparent; border-color: var(--border); color: var(--dim); }
-  .tab.inactive:hover { border-color: var(--text); color: var(--text); }
+  .metric-key { font-size: 0.52rem; color: var(--muted); letter-spacing: 2px; margin-top: 3px; }
+  .green { color: var(--green); }
+  .red   { color: var(--red); }
+  .gold  { color: var(--gold); }
 
-  /* ── Detail panel ── */
-  .detail-panel {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: 20px 24px; margin-bottom: 20px; position: relative;
-    animation: slideIn .2s ease;
+  /* ── Score bar ── */
+  .score-section { margin-top: 14px; }
+  .score-bar-wrap { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .score-bar { flex: 1; height: 3px; background: var(--border); border-radius: 2px; }
+  .score-fill { height: 100%; border-radius: 2px; background: var(--green); box-shadow: 0 0 6px rgba(0,255,136,0.5); transition: width .6s ease; }
+  .score-label { font-family: var(--display); font-size: 1rem; font-weight: 700; color: var(--green); min-width: 40px; text-align: right; }
+
+  /* ── Range indicator ── */
+  .range-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .range-label { font-size: 0.55rem; color: var(--muted); letter-spacing: 1px; width: 52px; }
+  .range-track { flex: 1; height: 4px; background: var(--border); border-radius: 2px; position: relative; }
+  .range-pos {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); box-shadow: 0 0 8px var(--green);
   }
-  @keyframes slideIn { from { opacity:0; transform: translateY(-8px); } to { opacity:1; transform:translateY(0); } }
-  .detail-close { position: absolute; top: 12px; right: 16px; background: none; border: none; color: var(--dim); cursor: pointer; font-size: 1.1rem; }
-  .detail-close:hover { color: var(--red); }
-  .detail-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-top: 12px; }
-  .detail-item { }
-  .detail-val { font-family: var(--head); font-size: 1.4rem; letter-spacing: 1px; }
-  .detail-key { font-family: var(--mono); font-size: 0.58rem; color: var(--dim); letter-spacing: 2px; margin-top: 2px; }
 
-  /* ── Responsive ── */
-  @media (max-width: 768px) {
-    .header { flex-direction: column; gap: 12px; padding: 14px 16px; }
-    .main { padding: 14px 16px; }
-    .stat-row { grid-template-columns: repeat(2,1fr); }
-    .detail-grid { grid-template-columns: repeat(2,1fr); }
+  /* ── Party-over badge ── */
+  .heat-badge {
+    font-family: var(--display); font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 2px; padding: 4px 10px; border-radius: 2px;
+    background: rgba(0,255,136,0.12); color: var(--green); border: 1px solid rgba(0,255,136,0.3);
+  }
+
+  /* ── Disclaimer ── */
+  .disclaimer {
+    text-align: center; font-size: 0.55rem; color: var(--dim);
+    letter-spacing: 1px; margin-top: 28px; line-height: 2;
+  }
+
+  /* ── No results ── */
+  .no-results { text-align: center; padding: 60px; }
+  .no-results p { font-size: 0.65rem; color: var(--muted); letter-spacing: 1px; line-height: 2.5; }
+
+  @media (max-width: 640px) {
+    .hdr { flex-direction: column; gap: 12px; padding: 14px 16px; }
+    .main { padding: 16px; }
+    .card-metrics { grid-template-columns: repeat(3,1fr); }
+    .logo { font-size: 1.8rem; }
   }
 `;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 const fmt = {
-  price:  v => `$${parseFloat(v).toFixed(4)}`,
-  pct:    v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`,
-  vol:    v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(0)}K` : v,
+  price: v => `$${parseFloat(v).toFixed(4)}`,
+  pct:   v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`,
+  vol:   v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : `${(v/1e3).toFixed(0)}K`,
 };
 
-function SortIcon({ col, sort }) {
-  if (sort.col !== col) return <span className="sort-icon">↕</span>;
-  return <span className="sort-icon">{sort.dir === "asc" ? "↑" : "↓"}</span>;
-}
-
-// ─── Main Component ───────────────────────────────────────────────────────────
 export default function PennyPicker() {
-  const [apiKey, setApiKey]       = useState(() => localStorage.getItem("av_key") || "");
-  const [apiInput, setApiInput]   = useState(() => localStorage.getItem("av_key") || "");
-  const [stocks, setStocks]       = useState([]);
-  const [loading, setLoading]     = useState(false);
-  const [progress, setProgress]   = useState({ done: 0, total: 0, ticker: "" });
-  const [watchlist, setWatchlist] = useState(() => JSON.parse(localStorage.getItem("wl") || "[]"));
-  const [sort, setSort]           = useState({ col: "score", dir: "desc" });
-  const [tab, setTab]             = useState("all");
-  const [search, setSearch]       = useState("");
-  const [filterSig, setFilterSig] = useState("all");
-  const [filterMax, setFilterMax] = useState("5");
-  const [selected, setSelected]   = useState(null);
-  const [lastFetch, setLastFetch] = useState(null);
-  const [error, setError]         = useState("");
-
-  // persist watchlist
-  useEffect(() => { localStorage.setItem("wl", JSON.stringify(watchlist)); }, [watchlist]);
+  const [apiInput, setApiInput] = useState(() => localStorage.getItem("av_key") || "");
+  const [apiKey, setApiKey]     = useState(() => localStorage.getItem("av_key") || "");
+  const [picks, setPicks]       = useState([]);
+  const [loading, setLoading]   = useState(false);
+  const [prog, setProg]         = useState({ done: 0, total: 0, ticker: "" });
+  const [lastScan, setLastScan] = useState(null);
+  const [error, setError]       = useState("");
+  const [scanned, setScanned]   = useState(0);
 
   const saveKey = () => {
-    localStorage.setItem("av_key", apiInput.trim());
-    setApiKey(apiInput.trim());
-    setError("");
+    const k = apiInput.trim();
+    localStorage.setItem("av_key", k);
+    setApiKey(k);
   };
 
-  // Fetch one quote from AV (free tier: 25 req/day, ~5/min)
   const fetchQuote = async (sym) => {
     const url = `${AV_BASE}?function=GLOBAL_QUOTE&symbol=${sym}&apikey=${apiKey}`;
     const res = await fetch(url);
-    const data = await res.json();
-    if (data["Note"] || data["Information"]) throw new Error("rate_limit");
-    return data["Global Quote"];
+    const d = await res.json();
+    if (d["Note"] || d["Information"]) throw new Error("rate_limit");
+    return d["Global Quote"];
   };
 
   const runScan = useCallback(async () => {
-    if (!apiKey) { setError("Enter your Alpha Vantage API key first."); return; }
+    if (!apiKey) { setError("Paste your Alpha Vantage key first."); return; }
     setLoading(true);
     setError("");
-    setStocks([]);
-    setSelected(null);
+    setPicks([]);
+    setScanned(0);
 
-    const batch = PENNY_UNIVERSE.slice(0, 20); // free tier safe — 20 tickers
-    setProgress({ done: 0, total: batch.length, ticker: "" });
+    const batch = UNIVERSE.slice(0, 25);
+    setProg({ done: 0, total: batch.length, ticker: "" });
 
-    const results = [];
+    const qualified = [];
+
     for (let i = 0; i < batch.length; i++) {
       const sym = batch[i];
-      setProgress({ done: i, total: batch.length, ticker: sym });
+      setProg({ done: i, total: batch.length, ticker: sym });
       try {
         const quote = await fetchQuote(sym);
         if (!quote || !quote["05. price"]) continue;
-        const price = parseFloat(quote["05. price"]);
-        if (price > parseFloat(filterMax)) continue;
-        if (price <= 0) continue;
-        const computed = computeSignals(quote);
-        results.push({ sym, quote, ...computed });
-        setStocks([...results]);
+        const result = analyze(sym, quote);
+        setScanned(i + 1);
+        if (result) {
+          qualified.push(result);
+          // Sort by score desc, show top 5 live
+          const top5 = [...qualified]
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5);
+          setPicks(top5);
+        }
       } catch (e) {
         if (e.message === "rate_limit") {
-          setError("Rate limit hit. Free tier allows ~5 requests/min. Wait 60s and retry.");
+          setError("Rate limit hit — wait 60s and retry.");
           break;
         }
       }
-      // Respect AV free tier: ~5 calls/min
       if (i < batch.length - 1) await new Promise(r => setTimeout(r, 13000));
     }
 
-    setProgress({ done: batch.length, total: batch.length, ticker: "" });
-    setLastFetch(new Date());
+    setLastScan(new Date());
     setLoading(false);
-  }, [apiKey, filterMax]);
+  }, [apiKey]);
 
-  // Sort + filter
-  const visible = stocks
-    .filter(s => {
-      if (tab === "watchlist") return watchlist.includes(s.sym);
-      if (tab === "signals")   return s.signals.length > 0;
-      return true;
-    })
-    .filter(s => search ? s.sym.includes(search.toUpperCase()) : true)
-    .filter(s => filterSig === "all" ? true : s.signals.some(sig => sig.label === filterSig))
-    .sort((a, b) => {
-      const dir = sort.dir === "asc" ? 1 : -1;
-      const map = { score: "score", price: "price", pct: "pct", vol: "vol" };
-      const key = map[sort.col] || "score";
-      return (a[key] - b[key]) * dir;
-    });
-
-  const toggleSort = (col) => setSort(s => ({ col, dir: s.col === col && s.dir === "desc" ? "asc" : "desc" }));
-  const toggleWatch = (sym) => setWatchlist(w => w.includes(sym) ? w.filter(x => x !== sym) : [...w, sym]);
-
-  const stats = {
-    total:   stocks.length,
-    signals: stocks.filter(s => s.signals.length > 0).length,
-    gainers: stocks.filter(s => s.pct > 0).length,
-    hot:     stocks.filter(s => s.score >= 5).length,
-  };
-
-  const sel = selected ? stocks.find(s => s.sym === selected) : null;
+  const pctComplete = prog.total ? (prog.done / prog.total) * 100 : 0;
 
   return (
     <>
       <style>{css}</style>
       <div className="app">
-        {/* ── Header ── */}
-        <header className="header">
+
+        {/* Header */}
+        <header className="hdr">
           <div>
-            <div className="logo">PENNY<span>RADAR</span></div>
-            <div className="tagline">MOMENTUM · BREAKOUT · SIGNAL DETECTION</div>
+            <div className="logo">PENNY<em>RADAR</em></div>
+            <div className="sub">TOP 5 · HIGH CONVICTION · MOMENTUM STILL IN PLAY</div>
           </div>
-          <div className="api-bar">
+          <div className="api-row">
             <input
-              className="api-input"
-              placeholder="ALPHA VANTAGE API KEY"
+              className="api-in" type="password"
+              placeholder="ALPHA VANTAGE KEY"
               value={apiInput}
               onChange={e => setApiInput(e.target.value)}
               onKeyDown={e => e.key === "Enter" && saveKey()}
-              type="password"
             />
-            <button className="btn btn-ghost" onClick={saveKey}>SAVE</button>
-            <button className="btn btn-green" onClick={runScan} disabled={loading}>
-              {loading ? "SCANNING..." : "▶ SCAN"}
+            <button className="btn btn-save" onClick={saveKey}>SAVE</button>
+            <button className="btn btn-scan" onClick={runScan} disabled={loading}>
+              {loading ? `SCANNING ${prog.ticker}...` : "▶ SCAN"}
             </button>
           </div>
         </header>
 
-        {/* ── Status bar ── */}
-        <div className="status-bar">
+        {/* Status */}
+        <div className="status">
           <span>
-            <span className={`status-dot ${lastFetch ? "live" : ""}`} />
-            {lastFetch ? `LAST SCAN: ${lastFetch.toLocaleTimeString()}` : "AWAITING SCAN"}
+            <span className={`dot ${lastScan ? "live" : ""}`} />
+            {lastScan ? `LAST SCAN ${lastScan.toLocaleTimeString()}` : "READY"}
           </span>
-          <span>UNIVERSE: {PENNY_UNIVERSE.length} TICKERS</span>
-          <span>BATCH SIZE: 20 (FREE TIER SAFE)</span>
-          {error && <span style={{ color: "var(--red)", marginLeft: "auto" }}>⚠ {error}</span>}
+          <span>UNIVERSE: {UNIVERSE.length} TICKERS</span>
+          {scanned > 0 && <span>SCANNED: {scanned} · QUALIFIED: {picks.length}</span>}
+          {error && <span className="err">⚠ {error}</span>}
         </div>
 
         <div className="main">
-          {/* ── Loading bar ── */}
+
+          {/* Progress */}
           {loading && (
-            <div className="loading-bar-wrap">
-              <div className="loading-bar">
-                <div className="loading-bar-fill" style={{ width: `${(progress.done / progress.total) * 100}%` }} />
+            <div className="prog-wrap">
+              <div className="prog-bar">
+                <div className="prog-fill" style={{ width: `${pctComplete}%` }} />
               </div>
-              <div className="loading-label">
-                FETCHING {progress.ticker} — {progress.done}/{progress.total} — NOTE: FREE TIER PACES AT ~1 TICKER / 13s
+              <div className="prog-label">
+                CHECKING {prog.ticker} — {prog.done}/{prog.total} — FREE TIER: 1 TICKER / 13s
               </div>
             </div>
           )}
 
-          {/* ── Stat cards ── */}
-          <div className="stat-row">
-            <div className="stat-card">
-              <div className="stat-num green">{stats.total}</div>
-              <div className="stat-label">STOCKS SCANNED</div>
+          {/* Empty state */}
+          {picks.length === 0 && !loading && (
+            <div className="empty">
+              <div className="empty-title">TOP 5</div>
+              <div className="empty-sub">ONLY THE BEST MAKE THE LIST</div>
+              <ul className="empty-rules">
+                <li><span>✗</span> Already ran {">"}20% — skipped</li>
+                <li><span>✗</span> Price below open — skipped</li>
+                <li><span>✗</span> Rolled {">"}35% off high — skipped</li>
+                <li><span>✗</span> Volume under 400K — skipped</li>
+                <li><span>✓</span> Must have 3+ signals firing</li>
+                <li><span>✓</span> Conviction score 6+ only</li>
+              </ul>
             </div>
-            <div className="stat-card">
-              <div className="stat-num gold">{stats.signals}</div>
-              <div className="stat-label">ACTIVE SIGNALS</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-num green">{stats.gainers}</div>
-              <div className="stat-label">TODAY'S GAINERS</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-num" style={{ color: stats.hot > 0 ? "#ff6b35" : "var(--dim)" }}>{stats.hot}</div>
-              <div className="stat-label">HIGH CONVICTION</div>
-            </div>
-          </div>
+          )}
 
-          {/* ── Tabs + Filters ── */}
-          <div className="tabs">
-            {["all", "signals", "watchlist"].map(t => (
-              <div key={t} className={`tab ${tab === t ? "active" : "inactive"}`} onClick={() => setTab(t)}>
-                {t.toUpperCase()} {t === "watchlist" && `(${watchlist.length})`}
-              </div>
-            ))}
-          </div>
-
-          <div className="filters">
-            <span className="filter-label">FILTER:</span>
-            <input className="search-input" placeholder="TICKER..." value={search} onChange={e => setSearch(e.target.value)} />
-            <select className="filter-select" value={filterSig} onChange={e => setFilterSig(e.target.value)}>
-              <option value="all">ALL SIGNALS</option>
-              <option value="BREAKOUT">BREAKOUT</option>
-              <option value="MOMENTUM">MOMENTUM</option>
-              <option value="VOL SPIKE">VOL SPIKE</option>
-              <option value="SQUEEZE">SQUEEZE</option>
-              <option value="DOJI">DOJI</option>
-            </select>
-            <select className="filter-select" value={filterMax} onChange={e => setFilterMax(e.target.value)}>
-              <option value="1">UNDER $1</option>
-              <option value="2">UNDER $2</option>
-              <option value="5">UNDER $5</option>
-              <option value="10">UNDER $10</option>
-            </select>
-            <span className="filter-label" style={{ marginLeft: "auto" }}>{visible.length} RESULTS</span>
-          </div>
-
-          {/* ── Detail panel ── */}
-          {sel && (
-            <div className="detail-panel">
-              <button className="detail-close" onClick={() => setSelected(null)}>✕</button>
-              <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-                <span style={{ fontFamily: "var(--head)", fontSize: "1.8rem", color: "#fff", letterSpacing: 3 }}>{sel.sym}</span>
-                <div className="signals">
-                  {sel.signals.map(s => (
-                    <span key={s.label} className="signal-pill" style={{ color: s.color, borderColor: s.color, background: s.color + "15" }}>
-                      {s.label}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <div className="detail-grid">
-                {[
-                  { key: "PRICE",   val: fmt.price(sel.price) },
-                  { key: "CHANGE",  val: fmt.pct(sel.pct),      color: sel.pct >= 0 ? "var(--green)" : "var(--red)" },
-                  { key: "OPEN",    val: fmt.price(sel.open) },
-                  { key: "HIGH",    val: fmt.price(sel.high) },
-                  { key: "LOW",     val: fmt.price(sel.low) },
-                  { key: "VOLUME",  val: fmt.vol(sel.vol) },
-                  { key: "RANGE",   val: `$${(sel.high - sel.low).toFixed(4)}` },
-                  { key: "SCORE",   val: sel.score + " / 8" },
-                  { key: "WATCHLIST", val: watchlist.includes(sel.sym) ? "★ WATCHING" : "☆ NOT WATCHING" },
-                ].map(item => (
-                  <div className="detail-item" key={item.key}>
-                    <div className="detail-val" style={{ color: item.color || "var(--text)" }}>{item.val}</div>
-                    <div className="detail-key">{item.key}</div>
+          {/* Results */}
+          {picks.length > 0 && (
+            <div className="cards">
+              {picks.map((s, i) => (
+                <div key={s.sym} className={`card rank-${i + 1}`}>
+                  <div className="card-hdr">
+                    <div className="card-left">
+                      <span className="rank-num">#{i + 1}</span>
+                      <div>
+                        <div className="ticker">{s.sym}</div>
+                        <div className="signals">
+                          {s.signals.map(sig => (
+                            <span key={sig.label} className="sig"
+                              style={{ color: sig.color, borderColor: sig.color + "55", background: sig.color + "10" }}>
+                              {sig.label}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="heat-badge">
+                      {s.rangePos > 0.85 ? "NEAR HIGH" : s.rangePos > 0.6 ? "CLIMBING" : "BUILDING"}
+                    </div>
                   </div>
-                ))}
-              </div>
+
+                  <div className="card-metrics">
+                    <div className="metric">
+                      <div className="metric-val">{fmt.price(s.price)}</div>
+                      <div className="metric-key">PRICE</div>
+                    </div>
+                    <div className="metric">
+                      <div className={`metric-val ${s.pct >= 0 ? "green" : "red"}`}>{fmt.pct(s.pct)}</div>
+                      <div className="metric-key">CHANGE</div>
+                    </div>
+                    <div className="metric">
+                      <div className="metric-val">{fmt.vol(s.vol)}</div>
+                      <div className="metric-key">VOLUME</div>
+                    </div>
+                    <div className="metric">
+                      <div className="metric-val">{fmt.price(s.high)}</div>
+                      <div className="metric-key">DAY HIGH</div>
+                    </div>
+                    <div className="metric">
+                      <div className="metric-val gold">{((s.high - s.price) / s.price * 100).toFixed(1)}%</div>
+                      <div className="metric-key">TO HIGH</div>
+                    </div>
+                  </div>
+
+                  {/* Range position */}
+                  <div className="range-row">
+                    <span className="range-label">{fmt.price(s.low)}</span>
+                    <div className="range-track">
+                      <div className="range-pos" style={{ left: `${s.rangePos * 100}%` }} />
+                    </div>
+                    <span className="range-label" style={{ textAlign: "right" }}>{fmt.price(s.high)}</span>
+                  </div>
+
+                  {/* Score */}
+                  <div className="score-section">
+                    <div className="score-bar-wrap">
+                      <div className="score-bar">
+                        <div className="score-fill" style={{ width: `${(s.score / 10) * 100}%` }} />
+                      </div>
+                      <div className="score-label">{s.score}/10</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
 
-          {/* ── Table ── */}
-          {stocks.length === 0 && !loading ? (
-            <div className="state-box">
-              <div className="big">PENNYRADAR</div>
-              <p>Enter your Alpha Vantage API key above and hit SCAN.<br />Free keys at alphavantage.co — takes ~4 min for 20 tickers.</p>
-            </div>
-          ) : (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th></th>
-                    <th>TICKER</th>
-                    <th className={sort.col === "price" ? "active" : ""} onClick={() => toggleSort("price")}>
-                      PRICE <SortIcon col="price" sort={sort} />
-                    </th>
-                    <th className={sort.col === "pct" ? "active" : ""} onClick={() => toggleSort("pct")}>
-                      CHG% <SortIcon col="pct" sort={sort} />
-                    </th>
-                    <th className={sort.col === "vol" ? "active" : ""} onClick={() => toggleSort("vol")}>
-                      VOLUME <SortIcon col="vol" sort={sort} />
-                    </th>
-                    <th>DAY RANGE</th>
-                    <th>SIGNALS</th>
-                    <th className={sort.col === "score" ? "active" : ""} onClick={() => toggleSort("score")}>
-                      SCORE <SortIcon col="score" sort={sort} />
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {visible.map(s => {
-                    const rangeWidth = s.high > s.low ? ((s.price - s.low) / (s.high - s.low)) * 100 : 50;
-                    return (
-                      <tr key={s.sym} className={watchlist.includes(s.sym) ? "watching" : ""} onClick={() => setSelected(s.sym === selected ? null : s.sym)}>
-                        <td onClick={e => { e.stopPropagation(); toggleWatch(s.sym); }}>
-                          <button className={`star ${watchlist.includes(s.sym) ? "on" : "off"}`}>
-                            {watchlist.includes(s.sym) ? "★" : "☆"}
-                          </button>
-                        </td>
-                        <td className="ticker-cell">{s.sym}</td>
-                        <td className="price-cell">{fmt.price(s.price)}</td>
-                        <td className={s.pct >= 0 ? "pct-pos" : "pct-neg"}>{fmt.pct(s.pct)}</td>
-                        <td className="vol-cell">{fmt.vol(s.vol)}</td>
-                        <td>
-                          <div className="sparkbar-wrap">
-                            <span style={{ fontSize: "0.6rem", color: "var(--dim)", width: 48 }}>{fmt.price(s.low)}</span>
-                            <div className="sparkbar">
-                              <div className="sparkbar-fill" style={{
-                                left: 0, width: `${rangeWidth}%`,
-                                background: s.pct >= 0 ? "var(--green)" : "var(--red)"
-                              }} />
-                            </div>
-                            <span style={{ fontSize: "0.6rem", color: "var(--dim)", width: 48 }}>{fmt.price(s.high)}</span>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="signals">
-                            {s.signals.slice(0, 3).map(sig => (
-                              <span key={sig.label} className="signal-pill"
-                                style={{ color: sig.color, borderColor: sig.color, background: sig.color + "18" }}>
-                                {sig.label}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                        <td className="score-cell">
-                          <span className={`score-badge score-${s.score}`}>{s.score}</span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+          {!loading && scanned > 0 && picks.length === 0 && (
+            <div className="no-results">
+              <p>NOTHING QUALIFIED THIS SCAN.<br />
+              MARKET MAY BE SLOW OR THE PARTY ALREADY HAPPENED.<br />
+              TRY AGAIN LATER.</p>
             </div>
           )}
+
+          <div className="disclaimer">
+            NOT FINANCIAL ADVICE · SIGNALS DETECT MOMENTUM PATTERNS ONLY<br />
+            PENNY STOCKS CARRY EXTREME RISK · ALWAYS DO YOUR OWN RESEARCH
+          </div>
         </div>
       </div>
     </>
